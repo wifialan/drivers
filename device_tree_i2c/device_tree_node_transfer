@@ -1,0 +1,128 @@
+第05节_device_node转换为platform_device
+
+dts -> dtb -> device_node -> platform_device
+
+两个问题:
+a. 哪些device_node可以转换为platform_device?
+根节点下含有compatile属性的子节点
+如果一个结点的compatile属性含有这些特殊的值("simple-bus","simple-mfd","isa","arm,amba-bus")之一, 那么它的子结点(需含compatile属性)也可以转换为platform_device
+i2c, spi等总线节点下的子节点, 应该交给对应的总线驱动程序来处理, 它们不应该被转换为platform_device
+
+b. 怎么转换?
+platform_device中含有resource数组, 它来自device_node的reg, interrupts属性;
+platform_device.dev.of_node指向device_node, 可以通过它获得其他属性
+
+本节总结:
+
+a. 内核函数of_platform_default_populate_init, 遍历device_node树, 生成platform_device
+b. 并非所有的device_node都会转换为platform_device
+   只有以下的device_node会转换:
+b.1 该节点必须含有compatible属性
+b.2 根节点的子节点(节点必须含有compatible属性)
+b.3 含有特殊compatible属性的节点的子节点(子节点必须含有compatible属性):
+    这些特殊的compatilbe属性为: "simple-bus","simple-mfd","isa","arm,amba-bus"
+
+b.4 示例: 
+    比如以下的节点, 
+    /mytest会被转换为platform_device, 
+    因为它兼容"simple-bus", 它的子节点/mytest/mytest@0 也会被转换为platform_device
+
+    /i2c节点一般表示i2c控制器, 它会被转换为platform_device, 在内核中有对应的platform_driver;
+    /i2c/at24c02节点不会被转换为platform_device, 它被如何处理完全由父节点的platform_driver决定, 一般是被创建为一个i2c_client。
+
+    类似的也有/spi节点, 它一般也是用来表示SPI控制器, 它会被转换为platform_device, 在内核中有对应的platform_driver;
+    /spi/flash@0节点不会被转换为platform_device, 它被如何处理完全由父节点的platform_driver决定, 一般是被创建为一个spi_device。
+    
+    / {
+          mytest {
+              compatile = "mytest", "simple-bus";
+              mytest@0 {
+                    compatile = "mytest_0";
+              };
+          };
+          
+          i2c {
+              compatile = "samsung,i2c";
+              at24c02 {
+                    compatile = "at24c02";                      
+              };
+          };
+
+          spi {
+              compatile = "samsung,spi";              
+              flash@0 {
+                    compatible = "winbond,w25q32dw";
+                    spi-max-frequency = <25000000>;
+                    reg = <0>;
+                  };
+          };
+      };
+
+
+函数调用过程: 
+a. of_platform_default_populate_init (drivers/of/platform.c) 被调用到过程:
+start_kernel     // init/main.c
+    rest_init();
+        pid = kernel_thread(kernel_init, NULL, CLONE_FS);
+                    kernel_init
+                        kernel_init_freeable();
+                            do_basic_setup();
+                                do_initcalls();
+                                    for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+                                        do_initcall_level(level);  // 比如 do_initcall_level(3)
+                                                                               for (fn = initcall_levels[3]; fn < initcall_levels[3+1]; fn++)
+                                                                                    do_one_initcall(initcall_from_entry(fn));  // 就是调用"arch_initcall_sync(fn)"中定义的fn函数
+
+b. of_platform_default_populate_init  (drivers/of/platform.c) 生成platform_device的过程:
+of_platform_default_populate_init
+    of_platform_default_populate(NULL, NULL, NULL);
+        of_platform_populate(NULL, of_default_bus_match_table, NULL, NULL)
+            for_each_child_of_node(root, child) {
+                rc = of_platform_bus_create(child, matches, lookup, parent, true);  // 调用过程看下面
+                            dev = of_device_alloc(np, bus_id, parent);   // 根据device_node节点的属性设置platform_device的resource
+                if (rc) {
+                    of_node_put(child);
+                    break;
+                }
+            }
+            
+c. of_platform_bus_create(bus, matches, ...)的调用过程(处理bus节点生成platform_devie, 并决定是否处理它的子节点):
+        dev = of_platform_device_create_pdata(bus, bus_id, platform_data, parent);  // 生成bus节点的platform_device结构体
+        if (!dev || !of_match_node(matches, bus))  // 如果bus节点的compatile属性不吻合matches成表, 就不处理它的子节点
+            return 0;
+
+        for_each_child_of_node(bus, child) {    // 取出每一个子节点
+            pr_debug("   create child: %pOF\n", child);
+            rc = of_platform_bus_create(child, matches, lookup, &dev->dev, strict);   // 处理它的子节点, of_platform_bus_create是一个递归调用
+            if (rc) {
+                of_node_put(child);
+                break;
+            }
+        }
+        
+d. I2C总线节点的处理过程:
+   /i2c节点一般表示i2c控制器, 它会被转换为platform_device, 在内核中有对应的platform_driver;
+   platform_driver的probe函数中会调用i2c_add_numbered_adapter:
+   
+   i2c_add_numbered_adapter   // drivers/i2c/i2c-core-base.c
+        __i2c_add_numbered_adapter
+            i2c_register_adapter
+                of_i2c_register_devices(adap);   // drivers/i2c/i2c-core-of.c
+                    for_each_available_child_of_node(bus, node) {
+                        client = of_i2c_register_device(adap, node);
+                                        client = i2c_new_device(adap, &info);   // 设备树中的i2c子节点被转换为i2c_client
+                    }
+                    
+e. SPI总线节点的处理过程:
+   /spi节点一般表示spi控制器, 它会被转换为platform_device, 在内核中有对应的platform_driver;
+   platform_driver的probe函数中会调用spi_register_master, 即spi_register_controller:
+   
+   spi_register_controller        // drivers/spi/spi.c
+        of_register_spi_devices   // drivers/spi/spi.c
+            for_each_available_child_of_node(ctlr->dev.of_node, nc) {
+                spi = of_register_spi_device(ctlr, nc);  // 设备树中的spi子节点被转换为spi_device
+                                spi = spi_alloc_device(ctlr);
+                                rc = of_spi_parse_dt(ctlr, spi, nc);
+                                rc = spi_add_device(spi);
+            }
+                    
