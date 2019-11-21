@@ -23,8 +23,6 @@
 #include <linux/kernel.h>   /* printk() */
 #include <linux/fs.h>       /* struct fops */
 #include <linux/errno.h>    /* error codes */
-#include <linux/cdev.h>     /* cdev_alloc()  */
-#include <linux/ioport.h>   /* request_mem_region() */
 #include <linux/delay.h>
 #include <linux/moduleparam.h>
 #include <linux/spi/spi.h>
@@ -39,7 +37,6 @@
 #include <linux/interrupt.h>
 #include <linux/pm.h>
 #include <linux/device.h>
-//#include <mach/spi.h>
 #include <asm/irq.h>
 #include <mach/gpio-nrs.h>
 #include <mach/regs-gpio.h>
@@ -48,82 +45,276 @@
 #include <plat/gpio-cfg.h>
 #include <linux/spi/spi.h>
 
+#include <linux/mtd/cfi.h>
+#include <linux/mtd/mtd.h>
+#include <linux/mtd/partitions.h>
+
 
 #define DRV_NAME "s3c2440_w25q16"
 #define DRV_AUTHOR "Alan Tian <alantian.at@gmail.com>"
 #define DRV_DESC "S3C2440 W25Q16 Driver"
 
-#define S3C2440_W25Q16_SIZE 0x1000
 
-#define S3C2440_W25Q16_MAJOR 0
-#define S3C2440_W25Q16_MINOR 0
+static int w25q16_bus_spi_probe(struct spi_device *spi);
+static int w25q16_spi_remove(struct spi_device *spi);
 
-static int major = S3C2440_W25Q16_MAJOR;
-static int minor = S3C2440_W25Q16_MINOR;
-
-static __devinit w25q16_bus_spi_probe(struct spi_device *spi);
-static int w25q16_bus_spi_remove(struct spi_device *spi);
-
-static int w25q16_open( struct inode *inodes, struct file *filp );
-static long w25q16_ioctl( struct file  *file, unsigned int cmd, unsigned long arg );
-static ssize_t w25q16_write( struct file *filp, const char __user *buffer, size_t size, loff_t *f_pos );
-static ssize_t w25q16_read( struct file *filp, const char __user *buffer, size_t size, loff_t *f_pos );
 
 struct spi_master *spi_master_p;
-struct spi_device *spi_w25q16_pdev;
+struct spi_device *spi_flash;
 struct spi_message *spi_mesg_p;
-static struct class *class;
 
-struct w25q16_dev_t {
-    struct cdev cdev;
-    unsigned char mem[S3C2440_W25Q16_SIZE];
-} *w25q16_pdev;
 
-static struct file_operations w25q16_ops = 
+void SPIFlashReadID(int *pMID, int *pDID)
 {
-    .owner      = THIS_MODULE,
-    .open       = w25q16_open,
-    .read       = w25q16_read,
-    .write      = w25q16_write,
-    .unlocked_ioctl = w25q16_ioctl,
-};
+    unsigned char tx_buf[4];
+    unsigned char rx_buf[2];
     
-static int w25q16_open( struct inode *inodes, struct file *filp )
-{
-    return 0;
-}
-static long w25q16_ioctl( struct file  *file, unsigned int cmd, unsigned long arg )
-{
-    return 0;
-}
-static ssize_t w25q16_write( struct file *filp, const char __user *buffer, size_t size, loff_t *f_pos )
-{
-    return 0;
-}
-static ssize_t w25q16_read( struct file *filp, const char __user *buffer, size_t size, loff_t *f_pos )
-{
-    return 0;
+    tx_buf[0] = 0x90;
+    tx_buf[1] = 0;
+    tx_buf[2] = 0;
+    tx_buf[3] = 0;
+
+    spi_write_then_read(spi_flash, tx_buf, 4, rx_buf, 2);
+
+    *pMID = rx_buf[0];
+    *pDID = rx_buf[1];
 }
 
-struct spi_board_info w25q16_board_info[] = 
+static void SPIFlashWriteEnable(int enable)
 {
+    unsigned char val = enable ? 0x06 : 0x04;
+    spi_write(spi_flash, &val, 1);    
+}
+
+static unsigned char SPIFlashReadStatusReg1(void)
+{
+    unsigned char val;
+    unsigned char cmd = 0x05;
+
+    spi_write_then_read(spi_flash, &cmd, 1, &val, 1);
+    
+    return val;
+}
+
+static unsigned char SPIFlashReadStatusReg2(void)
+{
+    unsigned char val;
+    unsigned char cmd = 0x35;
+
+    spi_write_then_read(spi_flash, &cmd, 1, &val, 1);
+    
+    return val;
+}
+
+static void SPIFlashWaitWhenBusy(void)
+{
+    while (SPIFlashReadStatusReg1() & 1)
     {
-    .modalias   = "w25q16",
-    .platform_data  = NULL,
-    .max_speed_hz   = 10*1000*1000,
-    .bus_num        = 0,
-    .chip_select    = S3C2410_GPG(2),
-    .mode           = SPI_MODE_3,
-//    .controller_data= &w25q16_csi,
+        /* 休眠一段时间 */
+        /* Sector erase time : 60ms
+         * Page program time : 0.7ms
+         * Write status reg time : 10ms
+         */
+		set_current_state(TASK_INTERRUPTIBLE);
+        schedule_timeout(HZ/100);  /* 休眠10MS后再次判断 */
     }
-};
+}
 
+static void SPIFlashWriteStatusReg(unsigned char reg1, unsigned char reg2)
+{    
+    unsigned char tx_buf[4];
 
-static const struct spi_device_id w25q16_spi_id[] =
+    SPIFlashWriteEnable(1);  
+    
+    tx_buf[0] = 0x01;
+    tx_buf[1] = reg1;
+    tx_buf[2] = reg2;
+
+    spi_write(spi_flash, tx_buf, 3);   
+
+    SPIFlashWaitWhenBusy();
+}
+
+static void SPIFlashClearProtectForStatusReg(void)
 {
-    {DRV_NAME,1},
-    {},
-};
+    unsigned char reg1, reg2;
+
+    reg1 = SPIFlashReadStatusReg1();
+    reg2 = SPIFlashReadStatusReg2();
+
+    reg1 &= ~(1<<7);
+    reg2 &= ~(1<<0);
+
+    SPIFlashWriteStatusReg(reg1, reg2);
+}
+
+
+static void SPIFlashClearProtectForData(void)
+{
+    /* cmp=0,bp2,1,0=0b000 */
+    unsigned char reg1, reg2;
+
+    reg1 = SPIFlashReadStatusReg1();
+    reg2 = SPIFlashReadStatusReg2();
+
+    reg1 &= ~(7<<2);
+    reg2 &= ~(1<<6);
+
+    SPIFlashWriteStatusReg(reg1, reg2);
+}
+
+/* erase 4K */
+void SPIFlashEraseSector(unsigned int addr)
+{
+    unsigned char tx_buf[4];
+    tx_buf[0] = 0x20;
+    tx_buf[1] = addr >> 16;
+    tx_buf[2] = addr >> 8;
+    tx_buf[3] = addr & 0xff;
+
+    SPIFlashWriteEnable(1);  
+
+    spi_write(spi_flash, tx_buf, 4);
+
+    SPIFlashWaitWhenBusy();
+}
+
+/* program */
+void SPIFlashProgram(unsigned int addr, unsigned char *buf, int len)
+{
+    unsigned char tx_buf[4];   
+	struct spi_transfer	t[] = {
+            {
+    			.tx_buf		= tx_buf,
+    			.len		= 4,
+        	},
+			{
+    			.tx_buf		= buf,
+    			.len		= len,
+			},
+		};
+	struct spi_message	m;
+
+    tx_buf[0] = 0x02;
+    tx_buf[1] = addr >> 16;
+    tx_buf[2] = addr >> 8;
+    tx_buf[3] = addr & 0xff;
+
+    SPIFlashWriteEnable(1);  
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t[0], &m);
+	spi_message_add_tail(&t[1], &m);
+	spi_sync(spi_flash, &m);
+
+    SPIFlashWaitWhenBusy();    
+}
+
+void SPIFlashRead(unsigned int addr, unsigned char *buf, int len)
+{
+    /* spi_write_then_read规定了tx_cnt+rx_cnt < 32
+     * 所以对于大量数据的读取，不能使用该函数
+     */
+     
+    unsigned char tx_buf[4];   
+	struct spi_transfer	t[] = {
+            {
+    			.tx_buf		= tx_buf,
+    			.len		= 4,
+        	},
+			{
+    			.rx_buf		= buf,
+    			.len		= len,
+			},
+		};
+	struct spi_message	m;
+
+    tx_buf[0] = 0x03;
+    tx_buf[1] = addr >> 16;
+    tx_buf[2] = addr >> 8;
+    tx_buf[3] = addr & 0xff;
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t[0], &m);
+	spi_message_add_tail(&t[1], &m);
+	spi_sync(spi_flash, &m);    
+}
+
+
+static void SPIFlashInit(void)
+{
+    SPIFlashClearProtectForStatusReg();
+    SPIFlashClearProtectForData();
+}
+
+/* 构造注册一个mtd_info
+ * mtd_device_register(master, parts, nr_parts)
+ *
+ */
+
+
+/* 首先: 构造注册spi_driver
+ * 然后: 在spi_driver的probe函数里构造注册mtd_info
+ */
+
+static struct mtd_info spi_flash_dev;
+
+static int spi_flash_erase(struct mtd_info *mtd, struct erase_info *instr)
+{
+    unsigned int addr = instr->addr;
+    unsigned int len  = 0;
+
+    /* 判断参数 */
+    if ((addr & (spi_flash_dev.erasesize - 1)) || (instr->len & (spi_flash_dev.erasesize - 1)))
+    {
+        printk("addr/len is not aligned\n");
+        return -EINVAL;
+    }
+
+    for (len = 0; len < instr->len; len += 4096)
+    {
+        SPIFlashEraseSector(addr);
+        addr += 4096;
+    }
+    
+	instr->state = MTD_ERASE_DONE;
+	mtd_erase_callback(instr);
+	return 0;
+}
+
+static int spi_flash_read(struct mtd_info *mtd, loff_t from, size_t len,
+		size_t *retlen, u_char *buf)
+{
+    SPIFlashRead(from, buf, len);
+	*retlen = len;
+	return 0;
+}
+
+static int spi_flash_write(struct mtd_info *mtd, loff_t to, size_t len,
+		size_t *retlen, const u_char *buf)
+{
+    unsigned int addr = to;
+    unsigned int wlen  = 0;
+
+    /* 判断参数 */
+    if ((to & (spi_flash_dev.erasesize - 1)) || (len & (spi_flash_dev.erasesize - 1)))
+    {
+        printk("addr/len is not aligned\n");
+        return -EINVAL;
+    }
+
+    for (wlen = 0; wlen < len; wlen += 256)
+    {
+        SPIFlashProgram(addr, (unsigned char *)buf, 256);
+        addr += 256;
+        buf += 256;
+    }
+
+	*retlen = len;
+	return 0;
+}
+
+
 
 static struct spi_driver w25q16_spi_driver =
 {
@@ -133,97 +324,53 @@ static struct spi_driver w25q16_spi_driver =
         .owner  = THIS_MODULE,
     },
     .probe      = w25q16_bus_spi_probe,
-    .remove     = __devexit_p(w25q16_bus_spi_remove),
-};
-
-static struct spi_device w25q16_spi_device =
-{
-    .modalias       = "w25q16",
-    .mode           = SPI_MODE_3,
-    .bits_per_word  = 16,
-    .chip_select    = SPI_CS_HIGH,
-    .max_speed_hz   = 100000,
-    .dev            = {
-       // .controller_data = &w25q16_board_info;
-    }
+    .remove     = __devexit_p(w25q16_spi_remove),
 };
 
 
 static int __devinit w25q16_bus_spi_probe(struct spi_device *spi)
 { 
-    int ret,err;
-    dev_t devid;
-    spi_w25q16_pdev = spi;
+    int mid, did;
+    printk("w25q16 probe function\n");
+    spi_flash = spi;
+
     s3c2410_gpio_cfgpin(spi->chip_select, S3C2410_GPIO_OUTPUT);
+    SPIFlashInit();
+    SPIFlashReadID(&mid, &did);
+    printk("SPI Flash ID: %02x %02x\n", mid, did);
+    memset(&spi_flash_dev, 0, sizeof(spi_flash_dev));
+    /* 构造注册一个mtd_info
+     * mtd_device_register(master, parts, nr_parts)
+     *
+     */
 
-    if(major) {
-       devid = MKDEV(major, 0);
-       ret = register_chrdev_region(devid, 1, DRV_NAME);
-       printk(DRV_NAME "\tOrigin Creat node %d\n",major);
-    } else {
-        ret = alloc_chrdev_region(&devid, 0, 1, DRV_NAME);
-        major = MAJOR(devid);
-        printk(DRV_NAME "\tArrage Creat node %d\n",major);
-    }
-    if(ret < 0) {
-        printk(DRV_NAME "\tnew device failed\n");
-        //goto fail_malloc;
-        return ret;
-    }
-    
-    w25q16_pdev = kzalloc(sizeof(struct w25q16_dev_t), GFP_KERNEL);
-    if(!w25q16_pdev) {
-       ret = -ENOMEM;
-       goto fail_malloc;
-    }
-    cdev_init(&w25q16_pdev->cdev, &w25q16_ops);
-    err = cdev_add(&w25q16_pdev->cdev, devid, 1);
-    if(err)
-        printk(DRV_NAME "\tError %d adding w25q16 %d\n",err, 1);
+	/* Setup the MTD structure */
+	spi_flash_dev.name = "w25q16_flash";
+	spi_flash_dev.type = MTD_NORFLASH;
+	spi_flash_dev.flags = MTD_CAP_NORFLASH;
+	spi_flash_dev.size = 0x200000;  /* 2M */
+	spi_flash_dev.writesize = 1;
+	spi_flash_dev.writebufsize = 4096; /* 没有用到 */
+	spi_flash_dev.erasesize = 4096;  /* 擦除的最小单位 */
 
-    class = class_create(THIS_MODULE, "w25q16");
-    device_create(class, NULL, MKDEV(major, minor), NULL, "w25q16");
-    printk(DRV_NAME "\tcreat device node /dev/w25q16 \n");
+	spi_flash_dev.owner = THIS_MODULE;
+	spi_flash_dev._erase = spi_flash_erase;
+	spi_flash_dev._read  = spi_flash_read;
+	spi_flash_dev._write = spi_flash_write;
 
+    mtd_device_register(&spi_flash_dev, NULL, 0);
+     
     return 0;
 
-fail_malloc:
-    printk("Failed to allocate memory!\n");
-    return ret;
-
 }
 
-static int w25q16_bus_spi_remove(struct spi_device *spi)
+static int w25q16_spi_remove(struct spi_device *spi)
 {
-    device_destroy(class, MKDEV(major, 0));
-    class_destroy(class);
-    cdev_del(&w25q16_pdev->cdev);
-    kfree(w25q16_pdev);
-    unregister_chrdev_region(MKDEV(major, minor), 1);
+    mtd_device_unregister(&spi_flash_dev);
     return 0;
+
 }
 
-MODULE_DEVICE_TABLE(spi, w25q16_spi_id);
-
-#if 0
-static struct spi_master w25q16_spi_master = 
-{
-    .num_chipselect = 4;
-}
-#endif
-
-
-#if 1
-
-#if 0
-static struct miscdevice w25q16_miscdev =
-{
-    .name       = DRV_NAME,
-    .fops       = &w25q16_ops,
-    .nodename   = DRV_NAME,
-};
-#endif
-#endif
 
 static int __init w25q16_driver_init(void)
 {
@@ -241,14 +388,9 @@ static int __init w25q16_driver_init(void)
 
 static void __exit w25q16_driver_exit(void)
 {
-    printk("Unregister w25q16 devices!\n");
+    printk("Unregister w25q16 flash!\n");
 //    misc_deregister(&w25q16_miscdev);
     spi_unregister_driver(&w25q16_spi_driver);
-    spi_unregister_device(spi_w25q16_pdev);
-    cdev_del(&w25q16_pdev->cdev);
-    kfree(w25q16_pdev);
-    unregister_chrdev_region(MKDEV(major, minor), 1);
-    printk("Unregister w25q16 devices!\n");
 }
 
 
