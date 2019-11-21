@@ -144,7 +144,7 @@ static ssize_t at24_write( struct file *filp, const char __user *buffer, size_t 
 {
     int ret,tmp;
     char i;
-    struct i2c_msg msg[3];
+    struct i2c_msg msg;
     char buffer_data[100];
 
     copy_from_user(buffer_data, buffer, 10);
@@ -158,13 +158,13 @@ static ssize_t at24_write( struct file *filp, const char __user *buffer, size_t 
         buffer_data[i+2] = i;
     }
     
-    msg[0].addr = at24_dev->client->addr | 0x01;
-    msg[0].flags = at24_dev->client->flags & 0;
-    msg[0].buf = &buffer_data[0];
-    msg[0].len = 66;
+    msg.addr = at24_dev->client->addr | 0x01;
+    msg.flags = at24_dev->client->flags & 0;
+    msg.buf = &buffer_data[0];
+    msg.len = 66;
 
-    ret = i2c_transfer(at24_dev->client->adapter,&msg[0],1);
-    tmp = (ret == 1) ? msg[0].len : ret;
+    ret = i2c_transfer(at24_dev->client->adapter,&msg,1);
+    tmp = (ret == 1) ? msg.len : ret;
 
     printk("i2c code: %d  return code: %d addr: 0x%02x%02x ",\
         ret,tmp,buffer_data[0],buffer_data[1]);
@@ -180,26 +180,23 @@ static ssize_t at24_read( struct file *filp, const char __user *buffer, size_t s
 {
     int ret,tmp;
     unsigned long i;
-    struct i2c_msg msg[3];
+    struct i2c_msg msg[2];
     char buffer_data[100];
 
     memset(buffer_data,0,sizeof(buffer_data));
     buffer_data[0] = (char)0x00;
     buffer_data[1] = (char)0x00;
-
-    /* 1st write data */
-    msg[1].addr = at24_dev->client->addr | 0x01;
-    msg[1].flags = at24_dev->client->flags & 0;
-    msg[1].buf = &buffer_data[0];
-    msg[1].len = 0;
-    /* 2nd write data */
-    msg[2].addr = at24_dev->client->addr | 0x01;
-    msg[2].flags = I2C_M_RD;
-    msg[2].buf = &buffer_data[2];
-    msg[2].len = 64;
+    buffer_data[2] = (char)0xAA;
+    buffer_data[3] = (char)0xAB;
+    buffer_data[4] = (char)0x0C;
     
-    ret = i2c_transfer(at24_dev->client->adapter, &msg[2], 1);
-    tmp = (ret == 1) ? msg[2].len : ret;
+    msg[0].addr = at24_dev->client->addr | 0x01;
+    msg[0].flags = I2C_M_RD;
+    msg[0].buf = &buffer_data[2];
+    msg[0].len = 64;
+
+    ret = i2c_transfer(at24_dev->client->adapter, &msg[0], 1);
+    tmp = (ret == 1) ? msg[0].len : ret;
 
     printk("i2c code: %d  return code: %d addr: 0x%02x%02x ",\
         ret,tmp,buffer_data[0],buffer_data[1]);
